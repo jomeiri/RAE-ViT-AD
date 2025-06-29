@@ -1,0 +1,42 @@
+import torch
+from rae_vit import RAEViT
+from preprocess import ADNIDataset, apply_noise
+from sklearn.metrics import confusion_matrix, roc_auc_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def generate_attention_maps(model, smri, save_path='attention_map.png'):
+    model.eval()
+    with torch.no_grad():
+        x = model.patch_embed(smri.cuda())
+        cls_token = model.cls_token.expand(smri.shape[0], -1, -1)
+        x = torch.cat([cls_token, x], dim=1) + model.pos_embed
+        attn = model.ram(x, torch.ones(smri.shape[0], x.shape[1]-1).cuda())
+        attn_map = attn[:, :, 1:].mean(dim=1).reshape(-1, 16, 16, 16)  # Reshape to 3D
+        plt.figure(figsize=(10, 10))
+        sns.heatmap(attn_map[0, :, :, 8].cpu().numpy(), cmap='viridis')
+        plt.savefig(save_path)
+        plt.close()
+
+def evaluate_noise_robustness():
+    test_dataset = ADNIDataset(root_dir='path/to/adni/test', modality='smri')
+    test_loader = DataLoader(test_dataset, batch_size=8)
+    model = RAEViT(img_size=128, embed_dim=768, num_classes=3).cuda()
+    model.load_state_dict(torch.load('path/to/rae_vit.pth'))
+    
+    preds, trues = [], []
+    for smri, labels in test_loader:
+        smri_noisy = apply_noise(smri, sigma=0.1)
+        outputs = model(smri_noisy.cuda())
+        preds.extend(torch.argmax(outputs, dim=1).cpu().numpy())
+        trues.extend(labels.cpu().numpy())
+    accuracy = accuracy_score(trues, preds)
+    auc = roc_auc_score(trues, preds, multi_class='ovr')
+    cm = confusion_matrix(trues, preds)
+    print(f'Noise Accuracy: {accuracy:.3f}, AUC: {auc:.3f}')
+    sns.heatmap(cm, annot=True, fmt='d')
+    plt.savefig('confusion_matrix_noise.png')
+    plt.close()
+
+if __name__ == '__main__':
+    evaluate_noise_robustness()
