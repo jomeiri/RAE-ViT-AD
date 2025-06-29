@@ -1,0 +1,53 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from sklearn.metrics import accuracy_score, roc_auc_score
+from preprocess import ADNIDataset, apply_noise, apply_smote
+from rae_vit import RAEViT
+import numpy as np
+
+def compute_class_weights(labels):
+    """Compute inverse frequency weights for AD, MCI, NC."""
+    counts = np.bincount(labels, minlength=3)
+    weights = 1.0 / (counts + 1e-6)  # Avoid division by zero
+    return torch.tensor(weights / weights.sum(), dtype=torch.float32)
+
+def train_model():
+    # Dataset
+    train_dataset = ADNIDataset(root_dir='path/to/adni/train', modality='smri')
+    test_dataset = ADNIDataset(root_dir='path/to/adni/test', modality='smri')
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=8)
+
+    # Model
+    model = RAEViT(img_size=128, embed_dim=768, num_classes=3).cuda()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    class_weights = compute_class_weights([label for _, label in train_dataset]).cuda()
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+    # Training loop
+    for epoch in range(50):
+        model.train()
+        for smri, labels in train_loader:
+            smri, labels = smri.cuda(), labels.cuda()
+            optimizer.zero_grad()
+            outputs = model(smri, region_mask=torch.ones(smri.shape[0], 128*128*128//8**3))  # Placeholder mask
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+    # Evaluation
+    model.eval()
+    preds, trues = [], []
+    with torch.no_grad():
+        for smri, labels in test_loader:
+            smri, labels = smri.cuda(), labels.cuda()
+            outputs = model(smri)
+            preds.extend(torch.argmax(outputs, dim=1).cpu().numpy())
+            trues.extend(labels.cpu().numpy())
+    accuracy = accuracy_score(trues, preds)
+    auc = roc_auc_score(trues, preds, multi_class='ovr')
+    print(f'Accuracy: {accuracy:.3f}, AUC: {auc:.3f}')
+
+if __name__ == '__main__':
+    train_model()
