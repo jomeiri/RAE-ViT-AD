@@ -1,0 +1,99 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class RegionalAttentionModule(nn.Module):
+    def __init__(self, dim, num_heads=8):
+        super().__init__()
+        self.num_heads = num_heads
+        self.scale = (dim // num_heads) ** -0.5
+        self.query = nn.Linear(dim, dim)
+        self.key = nn.Linear(dim, dim)
+        self.value = nn.Linear(dim, dim)
+        self.region_weight = nn.Parameter(torch.ones(1))  # Learnable weight for regional focus
+
+    def forward(self, x, region_mask):
+        B, N, C = x.shape
+        q = self.query(x).view(B, N, self.num_heads, C // self.num_heads).transpose(1, 2)
+        k = self.key(x).view(B, N, self.num_heads, C // self.num_heads).transpose(1, 2)
+        v = self.value(x).view(B, N, self.num_heads, C // self.num_heads).transpose(1, 2)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn + region_mask.unsqueeze(1) * self.region_weight  # Apply regional focus
+        attn = F.softmax(attn, dim=-1)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        return x
+
+class HierarchicalSelfAttention(nn.Module):
+    def __init__(self, dim, num_heads=8):
+        super().__init__()
+        self.local_attn = nn.MultiheadAttention(dim, num_heads)
+        self.global_attn = nn.MultiheadAttention(dim, num_heads)
+        self.w_local = nn.Parameter(torch.ones(1))
+        self.w_global = nn.Parameter(torch.ones(1))
+
+    def forward(self, x):
+        local_out, _ = self.local_attn(x, x, x)
+        global_out, _ = self.global_attn(x, x, x)
+        return self.w_local * local_out + self.w_global * global_out
+
+class MultiScalePatchEmbedding(nn.Module):
+    def __init__(self, img_size=128, patch_sizes=[8, 16], embed_dim=768):
+        super().__init__()
+        self.patch_embeds = nn.ModuleList([
+            nn.Conv3d(1, embed_dim // len(patch_sizes), kernel_size=p, stride=p)
+            for p in patch_sizes
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        embeddings = []
+        for embed in self.patch_embeds:
+            patches = embed(x).flatten(2).transpose(1, 2)
+            embeddings.append(patches)
+        x = torch.cat(embeddings, dim=-1)
+        return self.norm(x)
+
+class CrossModalAttention(nn.Module):
+    def __init__(self, dim, num_heads=8):
+        super().__init__()
+        self.num_heads = num_heads
+        self.scale = (dim // num_heads) ** -0.5
+        self.query_smri = nn.Linear(dim, dim)
+        self.key_pet = nn.Linear(dim, dim)
+        self.value_pet = nn.Linear(dim, dim)
+
+    def forward(self, smri_features, pet_features):
+        B, N, C = smri_features.shape
+        q = self.query_smri(smri_features).view(B, N, self.num_heads, C // self.num_heads).transpose(1, 2)
+        k = self.key_pet(pet_features).view(B, N, self.num_heads, C // self.num_heads).transpose(1, 2)
+        v = self.value_pet(pet_features).view(B, N, self.num_heads, C // self.num_heads).transpose(1, 2)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = F.softmax(attn, dim=-1)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        return x
+
+class RAEViT(nn.Module):
+    def __init__(self, img_size=128, embed_dim=768, num_heads=8, num_classes=3):
+        super().__init__()
+        self.patch_embed = MultiScalePatchEmbedding(img_size, embed_dim=embed_dim)
+        self.ram = RegionalAttentionModule(embed_dim, num_heads)
+        self.hsa = HierarchicalSelfAttention(embed_dim, num_heads)
+        self.cross_modal = CrossModalAttention(embed_dim, num_heads)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.randn(1, (img_size // 8) ** 3 + 1, embed_dim))
+        self.mlp_head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, num_classes)
+        )
+
+    def forward(self, smri, pet=None, region_mask=None):
+        x = self.patch_embed(smri)
+        cls_token = self.cls_token.expand(smri.shape[0], -1, -1)
+        x = torch.cat([cls_token, x], dim=1) + self.pos_embed
+        x = self.ram(x, region_mask if region_mask is not None else torch.zeros_like(x[:, :, 0]))
+        x = self.hsa(x)
+        if pet is not None:
+            pet_features = self.patch_embed(pet)
+            x = self.cross_modal(x, pet_features)
+        x = self.mlp_head(x[:, 0])
+        return x
