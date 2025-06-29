@@ -1,0 +1,41 @@
+import nibabel as nib
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+from imblearn.over_sampling import SMOTE
+import os
+
+class ADNIDataset(Dataset):
+    def __init__(self, root_dir, modality='smri', transform=None):
+        self.root_dir = root_dir
+        self.modality = modality
+        self.transform = transform
+        self.files = [f for f in os.listdir(root_dir) if f.endswith('.nii')]
+        self.labels = {'AD': 0, 'MCI': 1, 'NC': 2}  # Example mapping
+        self.data = [(f, self.labels[f.split('_')[1]]) for f in self.files]  # Assumes filename format: subject_modality_label.nii
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        file, label = self.data[idx]
+        img = nib.load(os.path.join(self.root_dir, file)).get_fdata()
+        img = np.resize(img, (128, 128, 128))  # Resize to 128x128x128
+        img = (img - img.min()) / (img.max() - img.min())  # Normalize to [0,1]
+        img = torch.tensor(img, dtype=torch.float32).unsqueeze(0)  # Add channel dim
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+
+def apply_noise(img, sigma=0.1):
+    """Add 10% Gaussian noise to image."""
+    noise = torch.normal(mean=0, std=sigma, size=img.shape)
+    return img + noise
+
+def apply_smote(X, y):
+    """Apply SMOTE to balance dataset."""
+    smote = SMOTE(random_state=42)
+    X_flat = X.reshape(X.shape[0], -1)
+    X_resampled, y_resampled = smote.fit_resample(X_flat, y)
+    X_resampled = X_resampled.reshape(-1, *X.shape[1:])
+    return X_resampled, y_resampled
